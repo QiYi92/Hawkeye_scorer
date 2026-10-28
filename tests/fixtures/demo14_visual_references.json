@@ -1,0 +1,33 @@
+{
+  "annotation_method": "Assistant visual selection on unannotated original-resolution frame 7 with pixel grid; NOT independently human-reviewed ground truth.",
+  "coordinate_system": "original image pixels; zero-based frame index",
+  "estimated_reference_uncertainty_px": 3,
+  "limitations": "Sparse visible points only. Ring points for difficult videos have no trusted physical ring ID. Do not interpret this as full-contour precision or recall.",
+  "frames": [
+    {"video": "video5", "frame_index": 7, "center": [634, 524], "ring_points": []},
+    {"video": "video6", "frame_index": 7, "center": [636, 524], "ring_points": [
+      {"ring_id": 2, "point": [694, 525]}, {"ring_id": 3, "point": [725, 526]},
+      {"ring_id": 4, "point": [758, 526]}, {"ring_id": 5, "point": [790, 526]},
+      {"ring_id": 6, "point": [822, 528]}, {"ring_id": 7, "point": [855, 532]},
+      {"ring_id": 8, "point": [888, 533]}, {"ring_id": 9, "point": [924, 536]}
+    ]},
+    {"video": "video7", "frame_index": 7, "center": [631, 524], "ring_points": []},
+    {"video": "video8", "frame_index": 7, "center": [600, 520], "ring_points": []},
+    {"video": "video9", "frame_index": 7, "center": [724, 516], "ring_points": [
+      {"ring_id": null, "point": [852, 519]}, {"ring_id": null, "point": [889, 523]},
+      {"ring_id": null, "point": [917, 526]}, {"ring_id": null, "point": [951, 530]},
+      {"ring_id": null, "point": [987, 530]}, {"ring_id": null, "point": [1018, 535]}
+    ]},
+    {"video": "video10", "frame_index": 7, "center": [808, 513], "ring_points": []},
+    {"video": "video11", "frame_index": 7, "center": [810, 512], "ring_points": []},
+    {"video": "video12", "frame_index": 7, "center": [724, 519], "ring_points": []},
+    {"video": "video13", "frame_index": 7, "center": [731, 525], "ring_points": []},
+    {"video": "video14", "frame_index": 7, "center": [819, 676], "ring_points": [
+      {"ring_id": null, "point": [1030, 690]}, {"ring_id": null, "point": [1097, 696]},
+      {"ring_id": null, "point": [1154, 704]}, {"ring_id": null, "point": [1206, 710]}
+    ]},
+    {"video": "video15", "frame_index": 7, "center": [891, 512], "ring_points": []},
+    {"video": "video16", "frame_index": 7, "center": [807, 512], "ring_points": []},
+    {"video": "video17", "frame_index": 7, "center": [790, 475], "ring_points": []}
+  ]
+}

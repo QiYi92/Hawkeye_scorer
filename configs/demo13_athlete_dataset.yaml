@@ -1,0 +1,8 @@
+# YOLO segmentation 数据集示例；path 改为实际绝对路径。
+# image/label 文件必须同名；每个对象一行：0 x1 y1 x2 y2 ...（归一化 polygon）。
+path: /absolute/path/to/paraglider_dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: paraglider_athlete

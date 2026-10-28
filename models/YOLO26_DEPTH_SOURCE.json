@@ -1,0 +1,8 @@
+{
+  "model": "yolo26n-depth.pt",
+  "source": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.pt",
+  "sha256": "befed1b8561d8b2eaa66274b070cdfc9c44853bda6d6d62a04759f9383af74e9",
+  "bytes": 12998295,
+  "ultralytics_version": "8.4.164",
+  "task": "depth"
+}

@@ -1,0 +1,10 @@
+{
+  "filename": "exp-schp-201908261155-lip.pth",
+  "bytes": 267449349,
+  "sha256": "24fa3254ceeb74c8435458994a64b522fb439a3635b7b86ff470457e0413da00",
+  "source": "https://huggingface.co/levihsu/OOTDiffusion/blob/main/checkpoints/humanparsing/exp-schp-201908261155-lip.pth",
+  "download_url": "https://hf-mirror.com/levihsu/OOTDiffusion/resolve/main/checkpoints/humanparsing/exp-schp-201908261155-lip.pth",
+  "upstream_repo": "https://github.com/GoGoDuck912/Self-Correction-Human-Parsing",
+  "upstream_commit": "eb84c432cc697f494d99662a05f2335eb2f26095",
+  "verified_date": "2026-09-18"
+}

@@ -1,0 +1,44 @@
+# Python environments and generated files
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+htmlcov/
+.coverage*
+
+# Local data and model artifacts (kept on this machine)
+/output/
+/.cache/
+/training_video/
+/training_video_mark/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.task
+*.npz
+*.download
+*.part
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.log
+
+# Editor/OS state and credentials
+.DS_Store
+.vscode/
+.idea/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.secrets/
