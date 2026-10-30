@@ -236,7 +236,7 @@ class Demo15Tests(unittest.TestCase):
                 finally:reader.close()
 
     def test_depth_window_draws_text_and_original_pixel_landing_marker(self):
-        rows=observations();result=estimate(rows);row=rows[20]
+        rows=observations();result=estimate(rows);row=rows[result['event']['confirmation_frame']]
         row={**row,'image_size':[1280,720]}
         result['event']['point_px']=[638,524]
         with patch('demo15.render.draw_panel') as panel,patch('demo15.render.draw_label') as label:

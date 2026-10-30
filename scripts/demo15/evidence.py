@@ -7,6 +7,8 @@ import numpy as np
 from demo13.tracking import Instance, box_iou
 from demo13.contact import foot_bottom_points
 
+MAX_SHOE_FRAME_GAP = 3  # two missing frames between real observations
+
 
 class CameraRegistration:
     """A moving camera is usable when background registration is reliable.
@@ -212,12 +214,22 @@ def stabilized(point, row):
     return value[:2]/value[2]
 
 
-def associate_feet(rows, max_gap=3):
+def shoe_appearance(frame, labels, foot):
+    """Compact appearance of observed shoe pixels, not the surrounding paper."""
+    x1,y1,x2,y2=foot['bbox']
+    hsv=cv2.cvtColor(frame[y1:y2,x1:x2],cv2.COLOR_BGR2HSV)
+    mask=(labels[y1:y2,x1:x2]==2).astype(np.uint8)
+    histogram=cv2.calcHist([hsv],[0,1],mask,[16,4],[0,180,0,256])
+    return (histogram/max(1.,float(histogram.sum()))).ravel().round(5).tolist()
+
+
+def _associate_observed_feet(rows, max_gap=MAX_SHOE_FRAME_GAP):
     """Two-shoe global assignment with velocity, overlap and scale evidence."""
     active, next_id = {}, 0
     for row in rows:
         i=row['frame_id'];feet=row['feet']
-        active={k:v for k,v in active.items() if i-v['frame']<=max_gap and v['segment']==row.get('camera_segment',0)}
+        active={k:v for k,v in active.items() if i-v['frame']<=max_gap and
+                v['segment']==row.get('camera_segment',0) and v['camera_valid'] and row.get('camera_stable',True)}
         ids=list(active)
         costs={}
         for j,foot in enumerate(feet):
@@ -226,7 +238,7 @@ def associate_feet(rows, max_gap=3):
             for k in ids:
                 old=active[k];gap=i-old['frame']
                 predicted=old['point']+old['velocity']*gap
-                scale=max(12.,old['width'])
+                scale=max(12.,float(np.median(old['widths'])))
                 distance=np.linalg.norm(p-predicted)/scale
                 width=max(1.,foot['bbox'][2]-foot['bbox'][0])
                 size_error=abs(np.log(width/scale))
@@ -234,8 +246,15 @@ def associate_feet(rows, max_gap=3):
                 delta=p-old['point']
                 shifted=np.asarray(old['bbox'])+np.tile(delta,2)
                 overlap=box_iou(np.asarray(foot['bbox'],float),shifted)
-                if distance<1.35:
-                    costs[j,k]=distance+.15*size_error+.2*(1-overlap)
+                appearance=0.
+                if foot.get('appearance') is not None and old.get('appearance') is not None:
+                    appearance=float(cv2.compareHist(np.asarray(foot['appearance'],np.float32),
+                        np.asarray(old['appearance'],np.float32),cv2.HISTCMP_BHATTACHARYYA))
+                # Extra uncertainty is bounded and available only across a gap;
+                # stable recent scale survives a temporarily tiny shoe fragment.
+                uncertainty=1.+.12*(gap-1)
+                if distance<1.35*uncertainty and (gap==1 or appearance<.8):
+                    costs[j,k]=distance/uncertainty+.15*size_error+.2*(1-overlap)+.15*appearance
         best=(float('inf'),None)
         # Add a distinct dummy ID for each observation; unmatched cost is bounded.
         for assignment in permutations(ids+list(range(-len(feet),0)),len(feet)):
@@ -248,5 +267,62 @@ def associate_feet(rows, max_gap=3):
             velocity=(p-old['point'])/(i-old['frame']) if old else np.zeros(2)
             if old is not None:velocity=.7*velocity+.3*old['velocity']
             foot['foot_track_id']=k
+            foot['association']=dict(gap_frames=i-old['frame'] if old else None,
+                source='observed_match' if old else 'new_track',
+                cost=float(costs[j,k]) if old else None,
+                bounded_gap=bool(old and 1<i-old['frame']<=max_gap))
+            widths=(old['widths'] if old else [])+[max(1.,foot['bbox'][2]-foot['bbox'][0])]
             active[k]=dict(point=p,velocity=velocity,frame=i,bbox=foot['bbox'],
-                           width=foot['bbox'][2]-foot['bbox'][0],segment=row.get('camera_segment',0))
+                           widths=widths[-5:],appearance=foot.get('appearance'),
+                           camera_valid=row.get('camera_stable',True),segment=row.get('camera_segment',0))
+
+
+def associate_feet(rows, max_gap=MAX_SHOE_FRAME_GAP):
+    """Associate primary observations first; recovered pixels cannot swap them.
+
+    Recovered shoes can fill a bounded gap only with consistent primary RGB
+    observations on both sides. Ambiguous recovery remains a separate observation
+    rather than changing the velocity/identity of an established primary track.
+    """
+    original=[row['feet'] for row in rows]
+    for row,feet in zip(rows,original):
+        row['feet']=[f for f in feet if f.get('observation_source')!='recovered_rgb']
+    _associate_observed_feet(rows,max_gap)
+    tracks={}
+    for row in rows:
+        for foot in row['feet']:tracks.setdefault(foot['foot_track_id'],[]).append((row,foot))
+    next_id=max(tracks,default=-1)+1
+    for row,feet in zip(rows,original):
+        assigned={f['foot_track_id'] for f in row['feet']}
+        for foot in feet:
+            if foot.get('observation_source')!='recovered_rgb':continue
+            p=stabilized(foot['point'],row);foot['stabilized_point']=p.tolist()
+            matches=[]
+            for key,track in tracks.items():
+                if key in assigned:continue
+                before=[item for item in track if item[0]['frame_id']<row['frame_id']]
+                after=[item for item in track if item[0]['frame_id']>row['frame_id']]
+                if not before or not after:continue
+                a,b=before[-1],after[0]
+                gap=b[0]['frame_id']-a[0]['frame_id']
+                if (gap>max_gap or not row.get('camera_stable',True) or
+                    any(o.get('camera_segment',0)!=row.get('camera_segment',0) for o,f in (a,b))):continue
+                alpha=(row['timestamp']-a[0]['timestamp'])/(b[0]['timestamp']-a[0]['timestamp'])
+                expected=(1-alpha)*np.asarray(a[1]['stabilized_point'])+alpha*np.asarray(b[1]['stabilized_point'])
+                width=max(12.,float(np.median([f['bbox'][2]-f['bbox'][0] for o,f in (a,b)])))
+                distance=float(np.linalg.norm(p-expected)/width)
+                appearance=0.
+                if foot.get('appearance') is not None:
+                    errors=[cv2.compareHist(np.asarray(foot['appearance'],np.float32),
+                            np.asarray(f['appearance'],np.float32),cv2.HISTCMP_BHATTACHARYYA)
+                            for o,f in (a,b) if f.get('appearance') is not None]
+                    appearance=max(errors,default=0.)
+                if distance<=.65 and appearance<.8:matches.append((distance+.15*appearance,key))
+            matches.sort()
+            unique=bool(matches and (len(matches)==1 or matches[1][0]-matches[0][0]>=.2))
+            foot['foot_track_id']=matches[0][1] if unique else next_id
+            if not unique:next_id+=1
+            assigned.add(foot['foot_track_id'])
+            foot['association']=dict(source='bracketed_rgb_recovery' if unique else 'unlinked_rgb_recovery',
+                bounded_gap=unique,gap_frames=None,cost=float(matches[0][0]) if unique else None)
+        row['feet']=feet

@@ -4,5 +4,6 @@
   "support_seconds": 0.1,
   "window_seconds": 1.0,
   "descent_px_720": 12.0,
-  "motion_tolerance_720": 10.0
+  "motion_tolerance_720": 10.0,
+  "counter_evidence_seconds": 0.35
 }

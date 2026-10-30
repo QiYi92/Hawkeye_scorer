@@ -4,7 +4,7 @@ import os
 import sys
 
 项目根目录=Path(__file__).resolve().parent
-输入视频='training_video/video29.mp4'
+输入视频='training_video/video35.mp4'
 批量目录=None  # 设为 'training_video' 分析全部视频
 深度模式='fusion'  # depth / fusion / visual；三种模式会共用证据进行对比
 关闭深度=False

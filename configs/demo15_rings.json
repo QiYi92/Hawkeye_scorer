@@ -1,0 +1,10 @@
+{
+  "ring_count": 10,
+  "preview_angles": 96,
+  "full_angles": 192,
+  "curve_samples": 361,
+  "update_interval": 5,
+  "history_seconds": 0.5,
+  "min_contrast": 5.0,
+  "max_error_px_720": 3.0
+}

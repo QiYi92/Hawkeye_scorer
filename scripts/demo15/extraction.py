@@ -14,10 +14,16 @@ from .references import timestamp
 from .core import aligned_depth, add_depth_features, _segment_depth_features, background_reference
 from .evidence import (CameraRegistration, pack_instance, unpack_instance, complete_athlete_track,
                        parse_athlete, shoe_observations, associate_feet)
+from .evidence import shoe_appearance, MAX_SHOE_FRAME_GAP
+from .recovery import ShoeRecovery
 from .target_hit import paper_outline
+from .rings import RingTracker, load_config, MODEL_VERSION
 
-EVIDENCE_VERSION = 5
+EVIDENCE_VERSION = 7
 EXTRACTION_CONFIG = dict(detector_sizes=[640,960], detector_conf=.15, parser="expanded_person_roi_coarse", camera="background_lk_640")
+EXTRACTION_CONFIG['rings'] = dict(version=MODEL_VERSION, **vars(load_config()))
+EXTRACTION_CONFIG['shoe_observations'] = dict(max_frame_gap=MAX_SHOE_FRAME_GAP,
+    recovery='bounded_lower_person_rgb', appearance='shoe_hs_16x4', association='recent_scale_uncertainty')
 
 
 class StaleEvidenceError(ValueError):
@@ -112,8 +118,11 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
     # latency. Trace the observed paper and bullseye here; refine rings only
     # around an automatically predicted event in the reporting stage.
     target = TargetTracker(Config(ring_count=2))
+    ring_tracker = RingTracker()
+    recovery = ShoeRecovery()
     observations=[]; depths=[]; exclusions=[]; grounds=[]
-    previous=-1.; started=time.perf_counter(); times=dict(segmentation=0.,parts=0.,depth=0.,scene=0.)
+    previous=-1.; started=time.perf_counter(); times=dict(segmentation=0.,parts=0.,depth=0.,scene=0.,ring_preview=0.)
+    times['observation_recovery']=0.
     factor=320/max(width,height)
     cache_size=(max(32,round(width*factor)),max(32,round(height*factor)))
     target_factor=min(1.,640/max(width,height))
@@ -171,6 +180,10 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
             paper=paper_region(frame)
             terrain=ground_mask(frame,paper)
             outline=paper_outline(paper,excluded>0)
+            ring_started=time.perf_counter()
+            target_result['ring_model']=ring_tracker.update(frame,target_result,
+                dict(frame_id=i,timestamp=t,**camera_info),excluded>0,found=paper)
+            times['ring_preview']+=time.perf_counter()-ring_started
             times['scene']+=time.perf_counter()-tic
             tic=time.perf_counter()
             depth=None
@@ -180,8 +193,15 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                     raise RuntimeError('模型未返回深度图；拒绝无深度回退')
                 depth=aligned_depth(result.depth.data.cpu().numpy(),(height,width))
             times['depth']+=time.perf_counter()-tic
+            tic=time.perf_counter()
+            labels,recovery_info=recovery.update(frame,labels,person,parser,i,camera_info)
+            times['observation_recovery']+=time.perf_counter()-tic
             feet=shoe_observations(labels) if labels is not None else []
             for foot in feet:
+                foot['appearance']=shoe_appearance(frame,labels,foot)
+                if any(box_iou(np.asarray(foot['bbox'],float),np.asarray(box,float))>.3
+                       for box in recovery_info['recovered_boxes']):
+                    foot['observation_source']='recovered_rgb'
                 x,y=foot['point']; foot['ground_region']=bool(terrain[max(0,y-2):min(height,y+3),max(0,x-2):min(width,x+3)].any())
                 foot['shoe_depth']=None
                 if depth is not None:
@@ -197,6 +217,7 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                              selection_reason='offline_observed_track' if selected is not None else selection_reasons[i],
                              person_bbox=person.bbox if person is not None else None,
                              parts_source=parts_source,feet=feet,target=target_result,paper_outline=outline,**camera_info)
+            observation['shoe_recovery']=recovery_info
             observations.append(observation)
             if depth is not None:
                 depths.append(cv2.resize(depth,cache_size,interpolation=cv2.INTER_AREA))
@@ -232,6 +253,10 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
         ref,reliable=add_depth_features(observations,depths,np.asarray(exclusions),np.asarray(grounds))
         np.savez_compressed(destination/'depth_cache.npz',depth=depths,exclusions=np.asarray(exclusions),grounds=np.asarray(grounds),ground_reference=ref,reliable=reliable)
     metadata=dict(athlete_masks_sha256=digest(destination/'athlete_masks.npz'),
+                  recovery_code_sha256=digest(Path(__file__).with_name('recovery.py')),
+                  observation_recovery=dict(calls=recovery.calls,parser_inferences=recovery.calls,
+                                            recovered_shoes=recovery.recovered),
+                  ring_code_sha256=digest(Path(__file__).with_name('rings.py')),
                   target_outline_code_sha256=hashlib.sha256(inspect.getsource(paper_outline).encode()).hexdigest(),evidence_version=EVIDENCE_VERSION, extraction_config=EXTRACTION_CONFIG, video=str(Path(video).resolve()),video_sha256=digest(video),fps=fps,
                   image_size=[width,height],frames=i,expected_frames=expected,complete=i==expected,
                   with_depth=with_depth,device=device,ultralytics=__version__,elapsed_seconds=time.perf_counter()-started,
@@ -250,6 +275,10 @@ def load_cache(path,video=None):
     metadata=json.loads((path/'metadata.json').read_text())
     if metadata.get('evidence_version') != EVIDENCE_VERSION or metadata.get('extraction_config') != EXTRACTION_CONFIG:
         raise StaleEvidenceError('证据缓存版本或提取配置已过期，请重新提取')
+    if metadata.get('ring_code_sha256') != digest(Path(__file__).with_name('rings.py')):
+        raise StaleEvidenceError('靶环模型代码已变化，请重新提取')
+    if metadata.get('recovery_code_sha256') != digest(Path(__file__).with_name('recovery.py')):
+        raise StaleEvidenceError('鞋部补检代码已变化，请重新提取')
     if metadata.get('code_sha256') != digest(__file__) or metadata.get('evidence_code_sha256') != digest(Path(__file__).with_name('evidence.py')):
         raise StaleEvidenceError('证据提取代码已变化，请重新提取')
     if metadata.get('target_outline_code_sha256') != hashlib.sha256(inspect.getsource(paper_outline).encode()).hexdigest():

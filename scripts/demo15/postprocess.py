@@ -12,6 +12,7 @@ from demo14.tracker import TargetTracker
 from .core import estimate, region
 from .evidence import parse_athlete, shoe_observations, add_refined_points
 from .target_hit import target_decision
+from .rings import RingTracker
 
 
 class ContactRefiner:
@@ -52,12 +53,23 @@ class ContactRefiner:
 
 def full_target(video, rows, frame_id):
     tracker=TargetTracker();cap=cv2.VideoCapture(str(video))
+    rings=RingTracker()
     target=rows[frame_id]['target']
     try:
         for i in range(frame_id+1):
             ok,frame=cap.read()
             if not ok:raise RuntimeError('触地帧靶盘复核解码失败')
-            if i>=max(0,frame_id-6):target=tracker.update(frame,i,rows[i]['timestamp'])
+            if i>=max(0,frame_id-6):
+                target=tracker.update(frame,i,rows[i]['timestamp'])
+                excluded=np.zeros(frame.shape[:2],np.uint8)
+                box=rows[i].get('person_bbox')
+                if box is not None:
+                    x1,y1,x2,y2=map(round,box)
+                    excluded[max(0,y1):min(len(frame),y2),max(0,x1):min(frame.shape[1],x2)]=1
+                model=rings.update(frame,target,rows[i],excluded,full=True)
+                preview_model=rows[i]['target'].get('ring_model',{})
+                target['ring_model']=(model if model.get('status')=='fitted' else preview_model)
+
     finally:cap.release()
     return target
 
@@ -103,6 +115,7 @@ def analyze_modes(video, rows, config, modes, cache, root, device='mps', shortcu
                     tic=time.perf_counter();targets[n]=full_target(video,rows,n)
                     ring_seconds+=time.perf_counter()-tic;ring_calls+=1
                 event['target_evidence']=targets[n]
+                rendered[n]['target']['ring_model']=targets[n].get('ring_model',{})
                 event['target_region']=region(event['point_px'],targets[n])
         event.update(target_hit=result['target_hit'],point_precision=result['point_precision'],
                      shortcut_reason=result['shortcut_reason'],camera_transform=row['camera_transform'])

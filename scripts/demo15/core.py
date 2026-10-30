@@ -15,11 +15,13 @@ class ContactConfig:
     window_seconds: float = 1.
     descent_px_720: float = 12.
     motion_tolerance_720: float = 10.
+    counter_evidence_seconds: float = .35
 
     def __post_init__(self):
         if not (0<self.near<self.separation and 0<self.support_seconds<=self.window_seconds<=2
-                and self.descent_px_720>0 and self.motion_tolerance_720>0):
-            raise ValueError('触地参数必须满足：0<接近阈值<分离阈值，0<支撑时间≤窗口≤2秒，像素容差为正')
+                and self.descent_px_720>0 and self.motion_tolerance_720>0
+                and self.support_seconds<=self.counter_evidence_seconds<=1.):
+            raise ValueError('触地参数必须满足：0<接近阈值<分离阈值，0<支撑时间≤窗口≤2秒，支撑时间≤反证窗口≤1秒，像素容差为正')
 
     def to_dict(self):
         return asdict(self)
@@ -135,14 +137,14 @@ def estimate(observations, mode='fusion', config=None):
     if mode not in MODES:raise ValueError(mode)
     cfg=config or ContactConfig()
     if mode=='depth':return estimate_depth(observations,mode,cfg)
-    from .evidence import associate_feet
+    from .evidence import associate_feet, MAX_SHOE_FRAME_GAP, stabilized
     associate_feet(observations)
     tracks={}
     for row in observations:
         if not row['camera_stable'] or row.get('parts_source','inferred')!='inferred':continue
         for foot in row['feet']:
             tracks.setdefault(foot['foot_track_id'],[]).append((row,foot))
-    candidates=[]
+    candidates=[];diagnostics=[]
     for track_id, track in tracks.items():
         for j,(row,foot) in enumerate(track):
             t=row['timestamp'];scale=row['image_size'][1]/720
@@ -151,7 +153,7 @@ def estimate(observations, mode='fusion', config=None):
             if len(before)<3 or len(after)<3:continue
             if after[-1][0]['timestamp']-t<.065:continue
             local=before[-4:]+after[1:]
-            if any(b[0]['frame_id']-a[0]['frame_id']>2 for a,b in zip(local,local[1:])):
+            if any(b[0]['frame_id']-a[0]['frame_id']>MAX_SHOE_FRAME_GAP for a,b in zip(local,local[1:])):
                 continue
             # Fit the approach locally: a distant airborne height alone is not
             # evidence that the current step belongs to the original landing.
@@ -177,45 +179,100 @@ def estimate(observations, mode='fusion', config=None):
             if not grounded:continue
             # A short plateau followed immediately by continued descent is an
             # airborne posture change, not contact. Upward release is allowed.
-            future=[(o,f) for o,f in track[j+1:j+16] if 0<o['timestamp']-t<=.23]
+            future=[(o,f) for o,f in track[j+1:]
+                    if 0<o['timestamp']-t<=cfg.counter_evidence_seconds+1e-6]
             baseline=foot['stabilized_point'][1]
             released=False;resumed=False
             for o,f in future:
                 dy=f['stabilized_point'][1]-baseline
                 if dy < -cfg.motion_tolerance_720*scale:released=True
                 if not released and dy>max(12*scale,(foot['bbox'][3]-foot['bbox'][1])*.6):resumed=True
-            if resumed:continue
+            if resumed:
+                diagnostics.append(dict(frame_id=row['frame_id'],foot_track_id=track_id,
+                    state='rejected_airborne',reason='observed_resumed_descent',
+                    evidence_frames=[o['frame_id'] for o,f in future]))
+                continue
             gaps=any(b[0]['frame_id']-a[0]['frame_id']>1 for a,b in zip(pre,pre[1:]))
             # A one-frame missing segmentation may be bridged by consistent
             # real observations on both sides, without inventing a contact.
-            adequate_prior=len(pre)>=4 and pre[-1][0]['frame_id']-pre[0][0]['frame_id']<=6
+            adequate_prior=len(pre)>=4 and pre[-1][0]['frame_id']-pre[0][0]['frame_id']<=8
             adequate_prior |= (len(pre)>=3 and not gaps and
                                pre_y[-1]-pre_y[0]>=2*cfg.descent_px_720*scale)
-            status='confirmed_estimate' if adequate_prior else 'needs_review'
+            # No observations is not evidence of "no resumed descent". A
+            # truncated track retains uncertainty instead of confirming by default.
+            future_observed=bool(future and future[-1][0]['timestamp']-t>=max(.10,cfg.support_seconds)-1e-6)
+            status='confirmed_estimate' if adequate_prior and future_observed else 'needs_review'
             residuals=[f.get('depth_residual') for o,f in after]
             depth_support=sum(v is not None and v<=cfg.near for v in residuals)
+            # Appearance masks and a valid background depth reference are only
+            # scene gates. Independent support must come from the observed shoe.
+            # A planted/rolling shoe and a body continuing over it is extra visual
+            # evidence, independent of possibly anomalous monocular depth.
+            body_relative=None
+            first,last=after[0],after[-1]
+            if first[0].get('person_bbox') is not None and last[0].get('person_bbox') is not None:
+                def body(item):
+                    box=np.asarray(item[0]['person_bbox'],float)
+                    return stabilized((box[:2]+box[2:])/2,item[0])
+                body_relative=float(np.linalg.norm((body(last)-body(first))-
+                    (np.asarray(last[1]['stabilized_point'])-first[1]['stabilized_point'])))
+            support_anchors=[]
+            if np.ptp(post_x)<=max(3*scale,(foot['bbox'][2]-foot['bbox'][0])*.35):
+                support_anchors.append('local_sole_stability')
+            if body_relative is not None and body_relative>=3*scale:
+                support_anchors.append('body_over_supporting_foot')
+            if mode=='fusion' and depth_support>=2:
+                support_anchors.append('persistent_depth_proximity')
+            if not support_anchors:status='needs_review'
+            frame_step=float(np.median(np.diff([o['timestamp'] for o,f in local])))
+            coverage=future[-1][0]['timestamp']-t if future else 0.
+            complete_counter=coverage>=cfg.counter_evidence_seconds-frame_step-1e-6
+            # A cropped/terminated trajectory with only a flat sole trace is
+            # still ambiguous. Actual body-over-foot or depth support can
+            # independently confirm a short observed contact, not an empty tail.
+            truncated_uncertain=(not complete_counter and not any(anchor in support_anchors
+                for anchor in ('body_over_supporting_foot','persistent_depth_proximity')))
+            if truncated_uncertain:status='needs_review'
             evidence=['observed_sole','same_foot_trajectory','background_compensated_descent',
                       'vertical_support_transition','future_descent_rejected']
             if mode=='fusion' and depth_support:evidence.append('auxiliary_depth_proximity')
             if gaps:evidence.append('bounded_observation_gap')
+            if body_relative is not None and body_relative>=3*scale:evidence.append('body_over_supporting_foot')
+            evidence.append('observed_short_term_support')
+            evidence.extend(support_anchors)
             confirmation=max(after+future,key=lambda item:item[0]['frame_id'])[0]
             event=dict(frame_id=row['frame_id'],timestamp=t,point_px=foot.get('contact_point',foot['point']),
                        point_source=foot.get('contact_point_source','observed_sole'),
                        foot_track_id=track_id,camera_segment=row.get('camera_segment',0),
                        candidate_interval=[t,after[-1][0]['timestamp']],
                        confirmation_frame=confirmation['frame_id'],confirmation_timestamp=confirmation['timestamp'],
-                       evidence=evidence,depth_residual=foot.get('depth_residual'),target_region='unknown',
+                       evidence=list(dict.fromkeys(evidence)),depth_residual=foot.get('depth_residual'),target_region='unknown',
                        motion_diagnostics=dict(descent_px_per_second=descent_speed,
                                                support_px_per_second=support_speed,
                                                support_range_px=float(np.ptp(post_y)),change_point_error=fit_error,
-                                               depth_support_frames=depth_support))
+                                               depth_support_frames=depth_support,
+                                               body_relative_motion_px=body_relative,
+                                               future_observed=future_observed,
+                                               counter_evidence_complete=bool(complete_counter),
+                                               counter_evidence_coverage_seconds=float(coverage),
+                                               support_anchors=support_anchors,
+                                               future_frames=[o['frame_id'] for o,f in future]))
+            reason=(None if status=='confirmed_estimate' else
+                    ('insufficient_observed_approach' if not adequate_prior else
+                     ('truncated_contact_track' if not future_observed or truncated_uncertain else 'weak_support_anchor')))
             candidates.append(dict(status=status,event=event,mode=mode,
-                                   failure_reason=None if adequate_prior else 'insufficient_observed_approach'))
+                                   failure_reason=reason))
+            diagnostics.append(dict(frame_id=row['frame_id'],foot_track_id=track_id,
+                state='support_confirmed' if status=='confirmed_estimate' else 'contact_candidate',reason=reason,
+                evidence_frames=sorted({o['frame_id'] for o,f in pre+after[1:]+future})))
     if candidates:
         earliest=min(c['event']['timestamp'] for c in candidates)
         onset=[c for c in candidates if c['event']['timestamp']<=earliest+.067]
-        return min(onset,key=lambda c:(c['event']['motion_diagnostics']['change_point_error'],c['event']['frame_id']))
-    return dict(status='unconfirmed',event=None,mode=mode,failure_reason='no_observed_support_transition')
+        result=min(onset,key=lambda c:(c['event']['motion_diagnostics']['change_point_error'],c['event']['frame_id']))
+        result['candidate_diagnostics']=diagnostics
+        return result
+    return dict(status='unconfirmed',event=None,mode=mode,failure_reason='no_observed_support_transition',
+                candidate_diagnostics=diagnostics)
 
 
 def estimate_depth(observations, mode='depth', config=None):
@@ -314,4 +371,5 @@ def region(point, target):
                 return 'unknown'
             if d>0:
                 return f'ring_{ring["ring_id"]}'
-    return 'inside_target_ring_unknown'
+    from .rings import fitted_region
+    return fitted_region(point, target.get('ring_model'))

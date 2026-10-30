@@ -12,6 +12,8 @@ REASON={'missing_prior_depth_separation':'缺少此前离地深度证据，早�
         'insufficient_observed_approach':'触地前真实鞋部观测不足',
         'no_observed_support_transition':'未检测到可靠的鞋底支撑转折',
         'unreliable_background_registration':'背景配准不可靠',
+        'truncated_contact_track':'候选后鞋部观测中断，尚不能确认支撑',
+        'weak_support_anchor':'缺少独立的局部支撑证据',
         'no_depth_ground_transition':'未检测到可靠的深度触地变化'}
 
 
@@ -39,9 +41,16 @@ def mark_event(canvas,o,result,label,color):
         cv2.circle(canvas,(x,y),20,color,2)
         draw_label(canvas,'候选区域' if pending else ('脱靶区域（粗略）' if result.get('point_precision')=='coarse' else '脱靶区域'),max(0,min(x+24,w-230)),max(25,min(y-16,h-10)),color,size=18)
         return
+    confirmed=result['status']=='confirmed_estimate' and o['frame_id']>=event.get('confirmation_frame',event['frame_id'])
+    if not confirmed:
+        color=(0,200,255)
+        # Pending events are regions, not precise scored contact crosshairs.
+        cv2.circle(canvas,(x,y),14,color,2)
+        draw_label(canvas,'候选区域（待确认）',max(0,min(x+18,w-230)),max(25,min(y-16,h-10)),color,size=18)
+        return
+    suffix='估计'
     cv2.circle(canvas,(x,y),9,color,2)
     cv2.drawMarker(canvas,(x,y),color,cv2.MARKER_CROSS,24,2)
-    suffix='估计' if result['status']=='confirmed_estimate' else '待复核'
     draw_label(canvas,f'{label}（{suffix}）',max(0,min(x+14,w-230)),max(25,min(y-16,h-10)),color,size=18)
 
 
@@ -59,11 +68,13 @@ def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_tit
     for f in o['feet']:
         x1,y1,x2,y2=f['bbox'];cv2.rectangle(canvas,(x1,y1),(x2,y2),(220,60,220),1)
         cv2.circle(canvas,tuple(f['point']),3,(220,60,220),-1)
-    for boundary in ('outer_boundary','bullseye_boundary'):
-        pts=o['target'].get(boundary,[])
-        for a,b in zip(pts,pts[1:]):
-            if a['source']==b['source']=='observed' and a['point'] and b['point']:
-                cv2.line(canvas,tuple(map(round,a['point'])),tuple(map(round,b['point'])),(255,220,0),1)
+    model=o['target'].get('ring_model',{})
+    if model.get('status')=='fitted':
+        for ring in reversed(model['rings']):
+            color=(0,220,255) if ring['ring_id']==1 else (255,220,0)
+            curve=np.rint(np.asarray(ring['points'])*256).astype(np.int32)
+            cv2.polylines(canvas,[curve],True,color,1,cv2.LINE_AA,shift=8)
+        cv2.drawMarker(canvas,tuple(map(round,model['center'])),(0,220,255),cv2.MARKER_CROSS,12,1,cv2.LINE_AA)
     event=result.get('event')
     depth_event=(depth_result or {}).get('event')
     same_event=bool(event and depth_event and event['frame_id']==depth_event['frame_id'] and event['point_px']==depth_event['point_px'])
@@ -99,7 +110,12 @@ def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_tit
             near=result.get('configuration',{}).get('near',.08)
             yy=top+gh-1-round(min(near,.5)/.5*(gh-1));cv2.line(canvas,(left,yy),(w-1,yy),(0,160,0),1)
             draw_label(canvas,'鞋与地面深度差',left+4,top+22,(230,230,230),size=15)
-    text=f'自动时间 {event["timestamp"]:.3f}秒；点 {event["point_px"]}' if event else f'原因：{REASON.get(result["failure_reason"],result["failure_reason"])}'
+    if event:
+        # Contact confirmation is independent of target visibility/classification.
+        confirmed=(result['status']=='confirmed_estimate' and o['frame_id']>=event.get('confirmation_frame',event['frame_id']))
+        text=(f'触地时间 {event["timestamp"]:.3f}秒；落点 {event["point_px"]}' if confirmed else
+              (f'候选时间 {event["timestamp"]:.3f}秒；候选区域待确认' if o['frame_id']>=event['frame_id'] else '等待首次触地'))
+    else:text=f'原因：{REASON.get(result["failure_reason"],result["failure_reason"])}'
     if coarse_miss:
         status=recognition_status(result,o['frame_id'])
         miss_text='脱靶，已跳过精确落点计算' if result.get('point_precision')=='coarse' else '脱靶，边界落点已复核'
@@ -107,8 +123,12 @@ def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_tit
               else ('等待首次触地' if status=='待识别' else '首次触地候选确认中'))
     reference_text=(f'参考：{reference["timestamp"]:.3f}秒，点 {reference["point_px"]}' if reference else '本视频无手动参考，不计算准确率')
     if coarse_miss and reference:reference_text=f'参考时间：{reference["timestamp"]:.3f}秒'
-    lines=[f'{view_title}｜{result["mode"]}｜{STATUS[result["status"]]}',
+    temporal_status=STATUS[result['status']]
+    if event and o['frame_id']<event['frame_id']:temporal_status='等待首次触地'
+    elif event and o['frame_id']<event.get('confirmation_frame',event['frame_id']):temporal_status='触地候选待确认'
+    lines=[f'{view_title}｜{result["mode"]}｜{temporal_status}',
            f'识别情况：{recognition_status(result,o["frame_id"])}',
+           '靶环：10/10（拟合）' if model.get('status')=='fitted' else '靶环待确认',
            f'帧 {o["frame_id"]}｜视频时间 {o["timestamp"]:.3f}秒｜{text}',
            '绿色：已确认估计；黄色：深度候选/待复核；红色：参考；紫色：鞋部',
            reference_text]
