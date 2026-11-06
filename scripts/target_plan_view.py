@@ -56,6 +56,9 @@ def draw_target_plan(
     point: tuple[float, float] | None,
     status: str,
     detail: str = "",
+    *,
+    radius_m: float = TARGET_REAL_RADIUS_M,
+    ring_interval_m: float = RING_INTERVAL_M,
 ) -> None:
     """Composite an always-visible inset, using fixed design coordinates."""
     height, width = frame.shape[:2]
@@ -70,16 +73,16 @@ def draw_target_plan(
     draw_text(panel, "靶盘平面图", (16, 32), (255, 255, 255), 0.78, 1)
     center, radius = (180, 198), 128
     cv2.circle(panel, center, radius, (205, 210, 210), -1, cv2.LINE_AA)
-    cv2.circle(panel, center, round(radius * BULLSEYE_RING_RADIUS_M / TARGET_REAL_RADIUS_M), (15, 15, 15), -1, cv2.LINE_AA)
+    cv2.circle(panel, center, round(radius * BULLSEYE_RING_RADIUS_M / radius_m), (15, 15, 15), -1, cv2.LINE_AA)
     for index in range(TARGET_RING_COUNT, 0, -1):
-        ring_radius = round(radius * index * RING_INTERVAL_M / TARGET_REAL_RADIUS_M)
+        ring_radius = round(radius * index * ring_interval_m / radius_m)
         color = (0, 220, 255) if index == 1 else (150, 125, 70)
         cv2.circle(panel, center, ring_radius, color, 1, cv2.LINE_AA)
         direction = 1 if index % 2 == 0 else -1
         offset = ring_radius / math.sqrt(2)
         label_x = round(center[0] + direction * offset) + (4 if direction > 0 else -39)
         label_y = round(center[1] - direction * offset)
-        draw_text(panel, f"{index * RING_INTERVAL_M:.1f}m", (label_x, label_y), (255, 255, 255), 0.46, 1)
+        draw_text(panel, f"{index * ring_interval_m:.1f}m", (label_x, label_y), (255, 255, 255), 0.46, 1)
     cv2.drawMarker(panel, center, (230, 230, 230), cv2.MARKER_CROSS, 8, 1)
     if point is not None:
         position, overflow = plan_marker_position(point)

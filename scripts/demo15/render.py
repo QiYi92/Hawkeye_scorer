@@ -5,9 +5,15 @@ import cv2
 import numpy as np
 from demo13.display_text import draw_panel,draw_label
 from .extraction import save_json
+from .target_plan import contact_plan_point, project_point, draw_plan, draw_ring_labels, score_text
 
 STATUS={'confirmed_estimate':'已确认触地估计','needs_review':'需要复核','unconfirmed':'未确认'}
 REASON={'missing_prior_depth_separation':'缺少此前离地深度证据，早期候选待复核',
+        'no_observed_shoes':'已选中运动员，但未获得可靠鞋部观测',
+        'no_observed_support_transition':'已有鞋部观测，但未确认首次接触的支撑转折',
+        'no_person_detections':'未检测到有效人体',
+        'no_landing_athlete_selected':'检测到人体，但未确认降落运动员身份',
+        'ambiguous_landing_athletes':'多个降落运动员候选，身份待确认',
         'preceding_observation_gap':'触地前观测中断，需人工复核',
         'insufficient_observed_approach':'触地前真实鞋部观测不足',
         'no_observed_support_transition':'未检测到可靠的鞋底支撑转折',
@@ -28,18 +34,19 @@ def depth_view(depth):
     return colored
 
 
-def mark_event(canvas,o,result,label,color):
+def mark_event(canvas,o,result,label,color,plan_point=None,show_score=False):
     event=result.get('event') if result else None
     if not event or o['frame_id']<event['frame_id']:return
     point=np.array([*event['point_px'],1.])
     if event.get('camera_transform') is not None:
         point=np.asarray(o['camera_transform'])@np.linalg.inv(np.asarray(event['camera_transform']))@point
     x,y=map(round,point[:2]/point[2]);h,w=canvas.shape[:2]
+    score=score_text(result,o['frame_id'],plan_point) if show_score else None
     if result.get('target_hit')=='miss':
-        pending=o['frame_id']<event.get('confirmation_frame',event['frame_id'])
+        pending=result['status']!='confirmed_estimate' or o['frame_id']<event.get('confirmation_frame',event['frame_id'])
         if pending:color=(0,200,255)
         cv2.circle(canvas,(x,y),20,color,2)
-        draw_label(canvas,'候选区域' if pending else ('脱靶区域（粗略）' if result.get('point_precision')=='coarse' else '脱靶区域'),max(0,min(x+24,w-230)),max(25,min(y-16,h-10)),color,size=18)
+        draw_label(canvas,'候选区域' if pending else (score or ('脱靶区域（粗略）' if result.get('point_precision')=='coarse' else '脱靶区域')),max(0,min(x+24,w-230)),max(25,min(y-16,h-10)),color,size=18)
         return
     confirmed=result['status']=='confirmed_estimate' and o['frame_id']>=event.get('confirmation_frame',event['frame_id'])
     if not confirmed:
@@ -51,7 +58,7 @@ def mark_event(canvas,o,result,label,color):
     suffix='估计'
     cv2.circle(canvas,(x,y),9,color,2)
     cv2.drawMarker(canvas,(x,y),color,cv2.MARKER_CROSS,24,2)
-    draw_label(canvas,f'{label}（{suffix}）',max(0,min(x+14,w-230)),max(25,min(y-16,h-10)),color,size=18)
+    draw_label(canvas,score or f'{label}（{suffix}）',max(0,min(x+14,w-230)),max(25,min(y-16,h-10)),color,size=18)
 
 
 def recognition_status(result, frame_id):
@@ -62,7 +69,7 @@ def recognition_status(result, frame_id):
     return {'hit':'落靶','miss':'脱靶','unknown':'待确认'}.get(result.get('target_hit'),'待确认')
 
 
-def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_title='Demo15'):
+def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_title='Demo15',plan_point=None):
     canvas=frame.copy();h,w=canvas.shape[:2]
     coarse_miss=result.get('target_hit')=='miss'
     for f in o['feet']:
@@ -75,13 +82,16 @@ def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_tit
             curve=np.rint(np.asarray(ring['points'])*256).astype(np.int32)
             cv2.polylines(canvas,[curve],True,color,1,cv2.LINE_AA,shift=8)
         cv2.drawMarker(canvas,tuple(map(round,model['center'])),(0,220,255),cv2.MARKER_CROSS,12,1,cv2.LINE_AA)
+        draw_ring_labels(canvas,model)
     event=result.get('event')
+    if plan_point is None and event and o['frame_id']==event['frame_id']:
+        plan_point=project_point(event['point_px'],model)
     depth_event=(depth_result or {}).get('event')
     same_event=bool(event and depth_event and event['frame_id']==depth_event['frame_id'] and event['point_px']==depth_event['point_px'])
     if depth_result and result['mode']!='depth' and not same_event and not coarse_miss:
         mark_event(canvas,o,depth_result,'深度候选',(0,200,255))
     label={'fusion':'深度＋运动落点','depth':'深度落点','visual':'视觉落点'}[result['mode']]
-    mark_event(canvas,o,result,label,(0,255,0) if result['status']=='confirmed_estimate' else (0,200,255))
+    mark_event(canvas,o,result,label,(0,255,0) if result['status']=='confirmed_estimate' else (0,200,255),plan_point=plan_point,show_score=True)
     if reference and not coarse_miss:
         reference_point=np.array([*reference['point_px'],1.])
         if reference.get('camera_transform') is not None:
@@ -142,6 +152,7 @@ def annotate(frame,o,result,reference=None,trace=None,depth_result=None,view_tit
         position=f'｜位置差 {error:.2f}像素' if error is not None else ''
         lines.append(f'自动点与参考：{ce["frame_id"]-reference["frame_id"]:+d}帧｜{(ce["timestamp"]-reference["timestamp"])*1000:+.0f}毫秒{position}')
     draw_panel(canvas,lines,max_width=min(w,1000),size=18)
+    draw_plan(canvas,o['frame_id'],result,plan_point)
     return canvas
 
 
@@ -216,10 +227,10 @@ class ReviewReader:
     def close(self):self.cap.release()
 
 
-def annotated_depth(depth,o,result,reference=None,depth_result=None):
+def annotated_depth(depth,o,result,reference=None,depth_result=None,plan_point=None):
     w,h=o['image_size']
     canvas=cv2.resize(depth_view(depth),(w,h))
-    return annotate(canvas,o,result,reference,depth_result=depth_result,view_title='Demo15 深度视图')
+    return annotate(canvas,o,result,reference,depth_result=depth_result,view_title='Demo15 深度视图',plan_point=plan_point)
 
 
 def export(video,path,rows,metadata,result,reference,depth_path=None,depth_result=None):
@@ -227,6 +238,7 @@ def export(video,path,rows,metadata,result,reference,depth_path=None,depth_resul
     w,h=metadata['image_size'];fps=metadata['fps']
     cap=cv2.VideoCapture(str(video));writer=cv2.VideoWriter(str(path/'video_overlay.mp4'),cv2.VideoWriter_fourcc(*'mp4v'),fps,(w,h))
     if not writer.isOpened():raise RuntimeError('无法创建叠加视频')
+    plan_point=contact_plan_point(rows,result)
     event=result.get('event');clip=None;reference_clip=None
     if reference and reference['frame_id']<len(rows):reference={**reference,'camera_transform':rows[reference['frame_id']]['camera_transform']}
     trace=[min((f['depth_residual'] for f in o['feet'] if f.get('depth_residual') is not None),default=None) for o in rows]
@@ -241,7 +253,7 @@ def export(video,path,rows,metadata,result,reference,depth_path=None,depth_resul
         for i,o in enumerate(rows):
             ok,frame=cap.read()
             if not ok:raise RuntimeError('导出时视频提前结束')
-            view=annotate(frame,o,result,reference,trace=trace,depth_result=depth_result)
+            view=annotate(frame,o,result,reference,trace=trace,depth_result=depth_result,plan_point=plan_point)
             writer.write(view);count+=1
             if event and i==event['frame_id']:
                 if not cv2.imwrite(str(path/'first_contact_frame.png'),view):raise RuntimeError('截图写入失败')
@@ -261,6 +273,7 @@ def export(video,path,rows,metadata,result,reference,depth_path=None,depth_resul
 
 
 def preview(video,path,rows,result,reference,depth_path=None,scale=.75,show_depth=True,depth_result=None,autoplay=True):
+    plan_point=contact_plan_point(rows,result)
     name='Demo15 - Review';cv2.namedWindow(name,cv2.WINDOW_NORMAL)
     event=result.get('event');initial_event=event or (depth_result or {}).get('event')
     index=0
@@ -286,13 +299,14 @@ def preview(video,path,rows,result,reference,depth_path=None,scale=.75,show_dept
                 depth_open=False
             if dirty:
                 frame=reader.read(index)
-                views=[(name,annotate(frame,rows[index],result,reference,trace=trace,depth_result=depth_result))]
+                views=[(name,annotate(frame,rows[index],result,reference,trace=trace,depth_result=depth_result,plan_point=plan_point))]
                 if depth_open:
-                    views.append((depth_name,annotated_depth(depths[index],rows[index],result,reference,depth_result)))
+                    views.append((depth_name,annotated_depth(depths[index],rows[index],result,reference,depth_result,plan_point)))
                 state='播放结束' if paused and index==len(rows)-1 else ('已暂停' if paused else '连续播放中')
                 for window,view in views:
                     if point:cv2.drawMarker(view,tuple(point),(255,255,0),cv2.MARKER_CROSS,20,2)
-                    draw_panel(view,[f'{state}｜空格播放/暂停｜A/D前后帧｜G预测｜T参考｜R从头播放',
+                    help_left=round(view.shape[1]*.29)
+                    draw_panel(view[:,help_left:],[f'{state}｜空格播放/暂停｜A/D前后帧｜G预测｜T参考｜R从头播放',
                                      '点击暂停并修正｜S保存修正｜Q/Esc退出'],bottom=True,size=16)
                     cv2.imshow(window,cv2.resize(view,None,fx=scale,fy=scale))
                 dirty=False

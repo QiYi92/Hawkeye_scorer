@@ -28,6 +28,8 @@ def review(run, output, baselines):
         cache=folder/'extraction'
         if not cache.exists():cache=Path(read_json(folder/'cache_source.json')['path'])
         meta=read_json(cache/'metadata.json')
+        actor_path=cache/'athlete_candidates.json'
+        actor=read_json(actor_path) if actor_path.exists() else {}
         if not meta['complete']:raise ValueError(f'Incomplete video: {folder.name}')
         rows=[json.loads(line) for line in (cache/'frames.jsonl').read_text().splitlines()]
         video=Path(meta['video']);event=result.get('event')
@@ -41,6 +43,10 @@ def review(run, output, baselines):
         trusted_recovery=sum(f.get('observation_source')=='recovered_rgb' and
             f.get('association',{}).get('source')=='bracketed_rgb_recovery' for o in rows for f in o['feet'])
         record=dict(video=folder.name,status=result['status'],target_hit=result['target_hit'],
+                    athlete_selection=actor,selection_seconds=meta['stage_seconds'].get('candidate_selection',0.),
+                    association_seconds=meta['stage_seconds'].get('candidate_association',0.),
+                    contact_kind=event.get('contact_kind') if event else None,
+                    fusion_processing=result.get('processing'),
                     point_precision=result['point_precision'],frame_id=event['frame_id'] if event else None,
                     point_px=event['point_px'] if event else None,
                     confirmation_frame=event['confirmation_frame'] if event else None,
@@ -104,6 +110,17 @@ def review(run, output, baselines):
         lines.append(f'| {r["video"]} | {recovery.get("calls",0)}/{recovery.get("recovered_shoes",0)}/{r["bracketed_recovered_shoes"]} | {r["recovery_seconds"]:.3f} | {r["extraction_seconds"]:.3f} | {r["postprocess_seconds"]:.3f} | {r["refinement_calls"]}/{r["ring_calls"]} |')
     lines+=['','补检是首次触地的基础观测，明确脱靶之后的精确精修与完整环复核单列。补检秒包含基础观测检查及实际补检；调用数为额外RGB分割次数。耗时来自各段完整运行，未声称为受控整机加速对照。',
             '', '每段目录包含原图鞋底逐帧放大、触地帧及确认帧主/深度视图、候选淘汰原因和轨迹关联诊断。video33 无人工真值，需逐帧复核首次接触，不宣称10像素正式通过。']
+    if any(r['athlete_selection'] for r in records):
+        lines+=['','## 运动员发现与接触路径','',
+                '| 视频 | 已选候选/路径 | 接触判定路径 | 默认fusion精修/环复核 | 候选关联秒 | 角色确认秒 |',
+                '|---|---|---|---:|---:|---:|']
+        for r in records:
+            actor=r['athlete_selection'];selected=actor.get('selected')
+            role=next((d for d in actor.get('roles',[]) if d['candidate']==selected),{})
+            work=r['fusion_processing'] or {}
+            lines.append(f'| {r["video"]} | {selected}/{role.get("path")} | {r["contact_kind"]} | {work.get("refinement_calls",0)}/{work.get("ring_calls",0)} | {r["association_seconds"]:.3f} | {r["selection_seconds"]:.3f} |')
+        lines+=['','候选关联耗时是segmentation阶段子项，不能重复相加。stable_support表示通过原有点运动门控，不代表整只鞋完全静止；sliding_or_rolling表示新增的鞋部区域支撑分支。全模式累计调用与默认fusion调用分开报告。',
+                '没有人工真值的视频均不计算正式帧/像素准确率。候选人体的筛选、临时ID关联和角色确认原因保存在各段提取缓存athlete_candidates.json。']
     (output/'report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 
 

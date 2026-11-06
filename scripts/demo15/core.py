@@ -167,13 +167,26 @@ def estimate(observations, mode='fusion', config=None):
             support_speed=float(np.polyfit(post_t,post_y,1)[0])
             fit_error=float(np.mean((np.polyval(np.polyfit(pre_t,pre_y,1),pre_t)-pre_y)**2)
                             +np.mean((np.polyval(np.polyfit(post_t,post_y,1),post_t)-post_y)**2))
-            if descent_speed<30*scale or support_speed>descent_speed*.35:continue
-            if np.ptp(post_y)>cfg.motion_tolerance_720*scale:continue
             post_x=[f['stabilized_point'][0] for o,f in after]
             # Supporting feet can roll/run, but a shoe travelling several
             # lengths during a vertical plateau is still flying forward.
-            if np.ptp(post_x)>max(cfg.motion_tolerance_720*scale,
-                                  (foot['bbox'][2]-foot['bbox'][0])*.75):continue
+            rejected=[]
+            if descent_speed<30*scale or support_speed>descent_speed*.35:rejected.append('no_point_support_transition')
+            if np.ptp(post_y)>cfg.motion_tolerance_720*scale:rejected.append('vertical_point_range')
+            if np.ptp(post_x)>max(cfg.motion_tolerance_720*scale,(foot['bbox'][2]-foot['bbox'][0])*.75):
+                rejected.append('horizontal_point_range')
+            rolling=None
+            if rejected:
+                from .rolling import rolling_support
+                rolling=rolling_support(pre,after,cfg)
+                if rolling is None:
+                    diagnostics.append(dict(frame_id=row['frame_id'],foot_track_id=track_id,
+                        state='rejected_motion',reason=','.join(rejected),
+                        horizontal_range_px=float(np.ptp(post_x)),vertical_range_px=float(np.ptp(post_y))))
+                    continue
+                pre_y,post_y=rolling['pre_y'],rolling['post_y']
+                descent_speed,support_speed=rolling['descent'],rolling['support']
+                fit_error=rolling['fit_error']
             grounded=any(f.get('ground_region',False) or
                          (mode=='fusion' and f.get('ground_valid',False)) for o,f in after)
             if not grounded:continue
@@ -181,10 +194,21 @@ def estimate(observations, mode='fusion', config=None):
             # airborne posture change, not contact. Upward release is allowed.
             future=[(o,f) for o,f in track[j+1:]
                     if 0<o['timestamp']-t<=cfg.counter_evidence_seconds+1e-6]
-            baseline=foot['stabilized_point'][1]
+            if (rolling and rolling['tangential_travel_fraction']>.75 and
+                not rolling['tangential_deceleration'] and
+                (not future or future[-1][0]['timestamp']-t<.2)):
+                diagnostics.append(dict(frame_id=row['frame_id'],foot_track_id=track_id,
+                    state='rejected_region_support',reason='fast_translation_without_observed_support'))
+                continue
+            baseline=post_y[0] if rolling else foot['stabilized_point'][1]
             released=False;resumed=False
             for o,f in future:
-                dy=f['stabilized_point'][1]-baseline
+                if rolling:
+                    from .rolling import sole_level
+                    level=sole_level(o,f)
+                    if level is None:continue
+                    dy=level-baseline
+                else:dy=f['stabilized_point'][1]-baseline
                 if dy < -cfg.motion_tolerance_720*scale:released=True
                 if not released and dy>max(12*scale,(foot['bbox'][3]-foot['bbox'][1])*.6):resumed=True
             if resumed:
@@ -223,6 +247,7 @@ def estimate(observations, mode='fusion', config=None):
                 support_anchors.append('body_over_supporting_foot')
             if mode=='fusion' and depth_support>=2:
                 support_anchors.append('persistent_depth_proximity')
+            if rolling and rolling['tangential_deceleration']:support_anchors.append('tangential_deceleration')
             if not support_anchors:status='needs_review'
             frame_step=float(np.median(np.diff([o['timestamp'] for o,f in local])))
             coverage=future[-1][0]['timestamp']-t if future else 0.
@@ -231,7 +256,7 @@ def estimate(observations, mode='fusion', config=None):
             # still ambiguous. Actual body-over-foot or depth support can
             # independently confirm a short observed contact, not an empty tail.
             truncated_uncertain=(not complete_counter and not any(anchor in support_anchors
-                for anchor in ('body_over_supporting_foot','persistent_depth_proximity')))
+                for anchor in ('body_over_supporting_foot','persistent_depth_proximity','tangential_deceleration')))
             if truncated_uncertain:status='needs_review'
             evidence=['observed_sole','same_foot_trajectory','background_compensated_descent',
                       'vertical_support_transition','future_descent_rejected']
@@ -240,10 +265,12 @@ def estimate(observations, mode='fusion', config=None):
             if body_relative is not None and body_relative>=3*scale:evidence.append('body_over_supporting_foot')
             evidence.append('observed_short_term_support')
             evidence.extend(support_anchors)
+            if rolling:evidence.append('observed_region_rolling_support')
             confirmation=max(after+future,key=lambda item:item[0]['frame_id'])[0]
             event=dict(frame_id=row['frame_id'],timestamp=t,point_px=foot.get('contact_point',foot['point']),
                        point_source=foot.get('contact_point_source','observed_sole'),
                        foot_track_id=track_id,camera_segment=row.get('camera_segment',0),
+                       contact_kind='sliding_or_rolling' if rolling else 'stable_support',
                        candidate_interval=[t,after[-1][0]['timestamp']],
                        confirmation_frame=confirmation['frame_id'],confirmation_timestamp=confirmation['timestamp'],
                        evidence=list(dict.fromkeys(evidence)),depth_residual=foot.get('depth_residual'),target_region='unknown',
@@ -257,6 +284,7 @@ def estimate(observations, mode='fusion', config=None):
                                                counter_evidence_coverage_seconds=float(coverage),
                                                support_anchors=support_anchors,
                                                future_frames=[o['frame_id'] for o,f in future]))
+            if rolling:event['motion_diagnostics']['region_support']={k:v for k,v in rolling.items() if k not in ('pre_y','post_y')}
             reason=(None if status=='confirmed_estimate' else
                     ('insufficient_observed_approach' if not adequate_prior else
                      ('truncated_contact_track' if not future_observed or truncated_uncertain else 'weak_support_anchor')))

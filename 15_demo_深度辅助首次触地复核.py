@@ -4,15 +4,15 @@ import os
 import sys
 
 项目根目录=Path(__file__).resolve().parent
-输入视频='training_video/video35.mp4'
+输入视频='training_video/video39.mp4'
 批量目录=None  # 设为 'training_video' 分析全部视频
 深度模式='fusion'  # depth / fusion / visual；三种模式会共用证据进行对比
 关闭深度=False
 推理设备='mps'  # CPU 使用 'cpu'r
 显示预览=True
-显示深度视图=True  # True 开启独立深度窗口；False 隐藏，仍进行深度计算
+显示深度视图=False  # True 开启独立深度窗口；False 隐藏，仍进行深度计算
 预览缩放=.75
-调试并冻结参数=False  # 需要批量目录，且仅用 video18–video23 调参
+调试并冻结参数=False  # 需要批量目录，且仅用 video18–video23 调参q
 冻结参数文件='configs/demo15_contact.json'  # 调试并冻结参数开启时自动忽略
 复用证据目录=None
 脱靶短路=True  # 明确脱靶后跳过鞋底精修与靶环计算

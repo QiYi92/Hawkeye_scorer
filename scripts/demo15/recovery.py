@@ -14,6 +14,7 @@ class ShoeRecovery:
     def __init__(self):
         self.last = None
         self.calls = self.recovered = 0
+        self.bootstrap_calls = 0
 
     def update(self, frame, labels, person, parser, frame_id, camera):
         result = dict(attempted=False, recovered_shoes=0, recovered_boxes=[])
@@ -31,11 +32,12 @@ class ShoeRecovery:
                              segment=camera.get('camera_segment', 0))
             return labels, result
         old = self.last
-        if (old is None or not 1 <= frame_id-old['frame'] < MAX_SHOE_FRAME_GAP or
-                old['segment'] != camera.get('camera_segment', 0)):
+        bootstrap=old is None
+        if (not bootstrap and (not 1 <= frame_id-old['frame'] < MAX_SHOE_FRAME_GAP or
+                old['segment'] != camera.get('camera_segment', 0))):
             return labels, result
-        delta = (box[:2]+box[2:]-old['box'][:2]-old['box'][2:])/2
-        ratio = (box[3]-box[1])/max(1., old['box'][3]-old['box'][1])
+        delta = (box[:2]+box[2:]-old['box'][:2]-old['box'][2:])/2 if old else np.zeros(2)
+        ratio = (box[3]-box[1])/max(1., old['box'][3]-old['box'][1]) if old else 1.
         if not .65 <= ratio <= 1.5:
             return labels, result
         h,w = labels.shape
@@ -46,6 +48,8 @@ class ShoeRecovery:
         if x2-x1 < 12 or y2-y1 < 12:
             return labels, result
         result['attempted'] = True; self.calls += 1
+        result['bootstrap']=bootstrap
+        if bootstrap:self.bootstrap_calls+=1
         close = np.zeros_like(labels)
         close[y1:y2,x1:x2] = parser.parse(frame[y1:y2,x1:x2])
         radius = max(5, round(height*.06))
@@ -56,6 +60,13 @@ class ShoeRecovery:
         used = set()
         recovered = []
         for candidate in proposals:
+            if bootstrap:
+                if (candidate['point'][1] >= box[1]+height*.55 and
+                    max(6.,np.count_nonzero(person.mask)*.0005)<=candidate['area']<=np.count_nonzero(person.mask)*.15):
+                    a,b,c,d=candidate['bbox'];patch=labels[b:d,a:c].copy()
+                    patch[close[b:d,a:c]==2]=2;labels[b:d,a:c]=patch
+                    recovered.append(candidate['bbox'])
+                continue
             appearance = shoe_appearance(frame, close, candidate)
             matches = []
             for index, previous in enumerate(old['feet']):

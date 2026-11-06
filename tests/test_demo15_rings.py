@@ -180,13 +180,16 @@ class ProjectiveFitTests(unittest.TestCase):
                 np.testing.assert_array_equal(points, call.args[1][0])
 
     def test_old_evidence_and_changed_model_code_are_rejected(self):
-        from demo15.extraction import load_cache, StaleEvidenceError, EVIDENCE_VERSION, EXTRACTION_CONFIG
+        from demo15.extraction import load_cache, StaleEvidenceError, EVIDENCE_VERSION, EXTRACTION_CONFIG, digest, role_code_digest
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path/'metadata.json').write_text(json.dumps({'evidence_version': 5}))
             with self.assertRaises(StaleEvidenceError): load_cache(path)
+            (path/'athlete_candidates.json').write_text('{}')
             (path/'metadata.json').write_text(json.dumps(dict(evidence_version=EVIDENCE_VERSION,
-                extraction_config=EXTRACTION_CONFIG, ring_code_sha256='obsolete')))
+                extraction_config=EXTRACTION_CONFIG, ring_code_sha256='obsolete',
+                athlete_code_sha256=digest(Path(__file__).resolve().parents[1]/'scripts/demo15/athlete.py'),
+                role_code_sha256=role_code_digest(),candidates_sha256=digest(path/'athlete_candidates.json'))))
             with self.assertRaisesRegex(StaleEvidenceError, '靶环模型'): load_cache(path)
 
 

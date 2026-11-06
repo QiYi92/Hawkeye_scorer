@@ -18,9 +18,12 @@ from .evidence import shoe_appearance, MAX_SHOE_FRAME_GAP
 from .recovery import ShoeRecovery
 from .target_hit import paper_outline
 from .rings import RingTracker, load_config, MODEL_VERSION
+from .athlete import CandidateAssociator, AthleteConfig, candidate_sequences, choose_landing_athlete
+from .core import ContactConfig
 
-EVIDENCE_VERSION = 7
+EVIDENCE_VERSION = 8
 EXTRACTION_CONFIG = dict(detector_sizes=[640,960], detector_conf=.15, parser="expanded_person_roi_coarse", camera="background_lk_640")
+EXTRACTION_CONFIG['athlete'] = vars(AthleteConfig())
 EXTRACTION_CONFIG['rings'] = dict(version=MODEL_VERSION, **vars(load_config()))
 EXTRACTION_CONFIG['shoe_observations'] = dict(max_frame_gap=MAX_SHOE_FRAME_GAP,
     recovery='bounded_lower_person_rgb', appearance='shoe_hs_16x4', association='recent_scale_uncertainty')
@@ -33,6 +36,13 @@ class StaleEvidenceError(ValueError):
 def feature_code_digest():
     source=''.join(inspect.getsource(f) for f in
                    (aligned_depth,add_depth_features,_segment_depth_features,background_reference))
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def role_code_digest():
+    from .core import estimate
+    from .rolling import rolling_support,sole_level
+    source=''.join(inspect.getsource(f) for f in (estimate,rolling_support,sole_level))
     return hashlib.sha256(source.encode()).hexdigest()
 
 
@@ -85,7 +95,8 @@ def target_coordinates(result,width,height):
     return result
 
 
-def extract(video, destination, root, device='mps', with_depth=True, max_frames=0):
+def extract(video, destination, root, device='mps', with_depth=True, max_frames=0, contact_config=None):
+    contact_config=contact_config or ContactConfig()
     config_directory=Path(os.environ.setdefault('YOLO_CONFIG_DIR',str(root/'.cache/demo15/ultralytics')))
     config_directory.mkdir(parents=True,exist_ok=True)
     # Older releases append this subdirectory to YOLO_CONFIG_DIR.
@@ -113,16 +124,18 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
     width,height = int(cap.get(3)),int(cap.get(4))
     expected = int(cap.get(7))
     primary = DescendingAthleteTrack(fps=fps)
+    associator = CandidateAssociator(fps)
     camera = CameraRegistration()
     # Full ring tracing is unrelated to contact inference and dominated CPU
     # latency. Trace the observed paper and bullseye here; refine rings only
     # around an automatically predicted event in the reporting stage.
     target = TargetTracker(Config(ring_count=2))
     ring_tracker = RingTracker()
-    recovery = ShoeRecovery()
+    recoveries = {}
     observations=[]; depths=[]; exclusions=[]; grounds=[]
     previous=-1.; started=time.perf_counter(); times=dict(segmentation=0.,parts=0.,depth=0.,scene=0.,ring_preview=0.)
     times['observation_recovery']=0.
+    times['candidate_association']=times['candidate_selection']=0.
     factor=320/max(width,height)
     cache_size=(max(32,round(width*factor)),max(32,round(height*factor)))
     target_factor=min(1.,640/max(width,height))
@@ -148,6 +161,9 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                         instances.append(Instance(-1-n*100-k,float(confidence),box.tolist(),mask,0))
             logical,status=primary.update(instances,n,frame)
             packed=[pack_instance(item,frame) for item in instances]
+            association_started=time.perf_counter()
+            associator.update(packed,n,(width,height))
+            times['candidate_association']+=time.perf_counter()-association_started
             choice=next((item for item in packed if item['track_id']==primary.source_track_id),None) if status=='tracked' else None
             detections.append(packed);selections.append(choice);selection_reasons.append(primary.reason)
             if n%60==0:print(f'{Path(video).name}：目标检测 {n}/{expected}',flush=True)
@@ -155,6 +171,9 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
         cap.release()
     times['segmentation']=time.perf_counter()-detection_started
     selections=complete_athlete_track(detections,selections,fps)
+    streams,profiles=candidate_sequences(detections,selections,(width,height))
+    trajectories={key:[] for key in streams}
+    recoveries={key:ShoeRecovery() for key in streams}
     cap=cv2.VideoCapture(str(video))
     i=0
     try:
@@ -164,13 +183,6 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                 break
             t,source=timestamp(cap.get(cv2.CAP_PROP_POS_MSEC)/1000,previous,fps,i); previous=t
             instances=[unpack_instance(item) for item in detections[i]]
-            selected=selections[i]
-            person=unpack_instance(selected,1) if selected is not None else None
-            logical,status=(1,'tracked') if person is not None else (None,'lost')
-            tic=time.perf_counter()
-            labels=parse_athlete(frame,person,parser) if person is not None else None
-            parts_source='inferred' if labels is not None else 'unavailable'
-            times['parts']+=time.perf_counter()-tic
             excluded=np.zeros((height,width),np.uint8)
             for item in instances:
                 excluded[item.mask]=1
@@ -193,31 +205,39 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                     raise RuntimeError('模型未返回深度图；拒绝无深度回退')
                 depth=aligned_depth(result.depth.data.cpu().numpy(),(height,width))
             times['depth']+=time.perf_counter()-tic
-            tic=time.perf_counter()
-            labels,recovery_info=recovery.update(frame,labels,person,parser,i,camera_info)
-            times['observation_recovery']+=time.perf_counter()-tic
-            feet=shoe_observations(labels) if labels is not None else []
-            for foot in feet:
-                foot['appearance']=shoe_appearance(frame,labels,foot)
-                if any(box_iou(np.asarray(foot['bbox'],float),np.asarray(box,float))>.3
-                       for box in recovery_info['recovered_boxes']):
-                    foot['observation_source']='recovered_rgb'
-                x,y=foot['point']; foot['ground_region']=bool(terrain[max(0,y-2):min(height,y+3),max(0,x-2):min(width,x+3)].any())
-                foot['shoe_depth']=None
-                if depth is not None:
-                    x1,y1,x2,y2=foot['bbox']
-                    shoe=(labels[y1:y2,x1:x2]==2).astype(np.uint8)
-                    interior=cv2.erode(shoe,np.ones((3,3),np.uint8))>0
-                    if not interior.any(): interior=shoe>0
-                    values=depth[y1:y2,x1:x2][interior]
-                    values=values[np.isfinite(values)&(values>0)]
-                    if len(values): foot['shoe_depth']=float(np.median(values))
             observation=dict(frame_id=i,timestamp=t,timestamp_source=source,image_size=[width,height],
-                             track_status=status,track_id=logical,
-                             selection_reason='offline_observed_track' if selected is not None else selection_reasons[i],
-                             person_bbox=person.bbox if person is not None else None,
-                             parts_source=parts_source,feet=feet,target=target_result,paper_outline=outline,**camera_info)
-            observation['shoe_recovery']=recovery_info
+                             track_status='lost',track_id=None,selection_reason=selection_reasons[i],
+                             person_bbox=None,parts_source='unavailable',feet=[],target=target_result,
+                             paper_outline=outline,**camera_info)
+            observation['person_candidate_count']=len(detections[i])
+            for key,sequence in streams.items():
+                selected=sequence[i];person=unpack_instance(selected,1) if selected is not None else None
+                tic=time.perf_counter()
+                labels=parse_athlete(frame,person,parser) if person is not None else None
+                times['parts']+=time.perf_counter()-tic
+                tic=time.perf_counter()
+                labels,recovery_info=recoveries[key].update(frame,labels,person,parser,i,camera_info)
+                times['observation_recovery']+=time.perf_counter()-tic
+                feet=shoe_observations(labels) if labels is not None else []
+                for foot in feet:
+                    foot['appearance']=shoe_appearance(frame,labels,foot)
+                    if any(box_iou(np.asarray(foot['bbox'],float),np.asarray(box,float))>.3
+                           for box in recovery_info['recovered_boxes']):
+                        foot['observation_source']='bootstrap_rgb' if recovery_info.get('bootstrap') else 'recovered_rgb'
+                    x,y=foot['point'];foot['ground_region']=bool(terrain[max(0,y-2):min(height,y+3),max(0,x-2):min(width,x+3)].any())
+                    foot['shoe_depth']=None
+                    if depth is not None:
+                        x1,y1,x2,y2=foot['bbox'];shoe=(labels[y1:y2,x1:x2]==2).astype(np.uint8)
+                        interior=cv2.erode(shoe,np.ones((3,3),np.uint8))>0
+                        if not interior.any():interior=shoe>0
+                        values=depth[y1:y2,x1:x2][interior];values=values[np.isfinite(values)&(values>0)]
+                        if len(values):foot['shoe_depth']=float(np.median(values))
+                row={**observation,'feet':feet,'person_bbox':person.bbox if person is not None else None,
+                     'track_status':'tracked' if person is not None else 'lost','track_id':1 if person is not None else None,
+                     'parts_source':'inferred' if labels is not None else 'unavailable',
+                     'selection_reason':'provisional_'+key,'athlete_candidate':key,'shoe_recovery':recovery_info}
+                trajectories[key].append(row)
+                observation['feet'].extend(feet)
             observations.append(observation)
             if depth is not None:
                 depths.append(cv2.resize(depth,cache_size,interpolation=cv2.INTER_AREA))
@@ -228,7 +248,7 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
                 exclusions.append(cv2.resize(fit_exclusion.astype(np.uint8),cache_size,interpolation=cv2.INTER_NEAREST)>0)
                 grounds.append(cv2.resize(terrain.astype(np.uint8),cache_size,interpolation=cv2.INTER_NEAREST)>0)
             if i%30==0:
-                print(f'{Path(video).name}：{i}/{expected} 帧，主目标 {status}，脚部 {len(feet)}，耗时 {time.perf_counter()-started:.1f}秒',flush=True)
+                print(f'{Path(video).name}：{i}/{expected} 帧，候选 {len(streams)}，脚部 {len(observation['feet'])}，耗时 {time.perf_counter()-started:.1f}秒',flush=True)
             i+=1
     finally:
         cap.release()
@@ -236,26 +256,48 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
         raise RuntimeError(f'视频未完整解码：{i}/{expected}，不执行正式评估')
     if not i:
         raise ValueError('视频为空')
-    associate_feet(observations)
-    # Persist real selected masks for lazy, per-event precision after the gate.
-    packed_size=(width*height+7)//8
-    masks=np.zeros((len(observations),packed_size),np.uint8)
-    valid=np.zeros(len(observations),bool)
-    for n,item in enumerate(selections):
-        if item is not None:
-            masks[n]=item['mask'];valid[n]=True
-    np.savez_compressed(destination/'athlete_masks.npz',masks=masks,valid=valid,
-                        image_shape=np.array([height,width]))
     times['contact_refinement']=0.
     ref=reliable=None
     if with_depth:
         depths=np.asarray(depths,np.float32)
         ref,reliable=add_depth_features(observations,depths,np.asarray(exclusions),np.asarray(grounds))
         np.savez_compressed(destination/'depth_cache.npz',depth=depths,exclusions=np.asarray(exclusions),grounds=np.asarray(grounds),ground_reference=ref,reliable=reliable)
-    metadata=dict(athlete_masks_sha256=digest(destination/'athlete_masks.npz'),
+    selection_started=time.perf_counter()
+    chosen,role_diagnostics,role_reason=choose_landing_athlete(trajectories,contact_config)
+    times['candidate_selection']+=time.perf_counter()-selection_started
+    if chosen is not None:
+        selected_rows=trajectories[chosen]
+        for row,scene in zip(selected_rows,observations):
+            row['selection_reason']='confirmed_'+chosen
+            row['person_candidate_count']=scene['person_candidate_count']
+            row['athlete_selection_status']=role_reason
+            if 'depth_scale' in scene:row['depth_scale']=scene['depth_scale']
+        observations=selected_rows;selections=streams[chosen]
+    else:
+        for row in observations:
+            row.update(feet=[],athlete_selection_status=role_reason,selection_reason=role_reason)
+        selections=[None]*len(observations)
+    associate_feet(observations)
+    packed_size=(width*height+7)//8
+    masks=np.zeros((len(observations),packed_size),np.uint8);valid=np.zeros(len(observations),bool)
+    for n,item in enumerate(selections):
+        if item is not None:masks[n]=item['mask'];valid[n]=True
+    np.savez_compressed(destination/'athlete_masks.npz',masks=masks,valid=valid,image_shape=np.array([height,width]))
+    candidate_report=dict(selected=chosen,status=role_reason,profiles=profiles,roles=role_diagnostics,
+        frames=[dict(frame_id=n,legacy_reason=selection_reasons[n],detections=[
+            {key:item[key] for key in ('track_id','candidate_id','candidate_association','bbox','confidence')} for item in items])
+            for n,items in enumerate(detections)])
+    save_json(destination/'athlete_candidates.json',candidate_report)
+    metadata=dict(athlete_code_sha256=digest(Path(__file__).with_name('athlete.py')),
+                  role_code_sha256=role_code_digest(),
+                  candidates_sha256=digest(destination/'athlete_candidates.json'),
+                  selection_contact_config=contact_config.to_dict(),athlete_selection=role_reason,
+                  athlete_masks_sha256=digest(destination/'athlete_masks.npz'),
                   recovery_code_sha256=digest(Path(__file__).with_name('recovery.py')),
-                  observation_recovery=dict(calls=recovery.calls,parser_inferences=recovery.calls,
-                                            recovered_shoes=recovery.recovered),
+                  observation_recovery=dict(calls=sum(r.calls for r in recoveries.values()),
+                      parser_inferences=sum(r.calls for r in recoveries.values()),
+                      bootstrap_calls=sum(r.bootstrap_calls for r in recoveries.values()),
+                      recovered_shoes=sum(r.recovered for r in recoveries.values())),
                   ring_code_sha256=digest(Path(__file__).with_name('rings.py')),
                   target_outline_code_sha256=hashlib.sha256(inspect.getsource(paper_outline).encode()).hexdigest(),evidence_version=EVIDENCE_VERSION, extraction_config=EXTRACTION_CONFIG, video=str(Path(video).resolve()),video_sha256=digest(video),fps=fps,
                   image_size=[width,height],frames=i,expected_frames=expected,complete=i==expected,
@@ -270,11 +312,20 @@ def extract(video, destination, root, device='mps', with_depth=True, max_frames=
     return observations,metadata
 
 
-def load_cache(path,video=None):
+def load_cache(path,video=None,contact_config=None):
     path=Path(path)
     metadata=json.loads((path/'metadata.json').read_text())
     if metadata.get('evidence_version') != EVIDENCE_VERSION or metadata.get('extraction_config') != EXTRACTION_CONFIG:
         raise StaleEvidenceError('证据缓存版本或提取配置已过期，请重新提取')
+    if metadata.get('athlete_code_sha256') != digest(Path(__file__).with_name('athlete.py')):
+        raise StaleEvidenceError('运动员候选关联代码已变化，请重新提取')
+    if metadata.get('role_code_sha256') != role_code_digest():
+        raise StaleEvidenceError('运动员角色证据判定代码已变化，请重新提取')
+    if contact_config is not None and metadata.get('selection_contact_config') != contact_config.to_dict():
+        raise StaleEvidenceError('运动员角色确认配置已变化，请重新提取')
+    candidate_path=path/'athlete_candidates.json'
+    if not candidate_path.exists() or digest(candidate_path)!=metadata.get('candidates_sha256'):
+        raise StaleEvidenceError('运动员候选诊断缺失或校验失败，请重新提取')
     if metadata.get('ring_code_sha256') != digest(Path(__file__).with_name('rings.py')):
         raise StaleEvidenceError('靶环模型代码已变化，请重新提取')
     if metadata.get('recovery_code_sha256') != digest(Path(__file__).with_name('recovery.py')):

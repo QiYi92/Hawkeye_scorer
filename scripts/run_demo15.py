@@ -155,17 +155,17 @@ def run(args):
         cache=cache_for(args.reuse_extraction,video.stem) if args.reuse_extraction else None
         if cache and (cache/'metadata.json').exists():
             try:
-                rows,meta=load_cache(cache,video)
+                rows,meta=load_cache(cache,video,contact_config=config)
                 if not args.max_frames and not meta['complete']:
                     raise StaleEvidenceError('短测缓存不能代替完整视频，重新提取')
             except StaleEvidenceError as error:
                 print(f'{video.name}：{error}；重新提取',flush=True)
                 cache=target/'extraction'
-                rows,meta=extract(video,cache,ROOT,args.device,not args.no_depth,args.max_frames)
+                rows,meta=extract(video,cache,ROOT,args.device,not args.no_depth,args.max_frames,contact_config=config)
             if not args.no_depth and not meta['with_depth']:raise ValueError('无深度缓存不能用于深度实验')
             save_json(target/'cache_source.json',dict(path=str(cache.resolve())))
         else:
-            cache=target/'extraction';rows,meta=extract(video,cache,ROOT,args.device,not args.no_depth,args.max_frames)
+            cache=target/'extraction';rows,meta=extract(video,cache,ROOT,args.device,not args.no_depth,args.max_frames,contact_config=config)
         actual_caches[video.stem]=cache
         actual_metadata[video.stem]=meta
         if args.max_frames and len(rows)>args.max_frames:
@@ -201,6 +201,8 @@ def run(args):
 
 def process(video,target,rows,meta,ref,config,args,cache):
     records=[];results={}
+    candidate_path=Path(cache)/'athlete_candidates.json'
+    actor_report=json.loads(candidate_path.read_text()) if candidate_path.exists() else {}
     modes=('visual',) if args.no_depth else MODES
     results,display_rows,timing,refinements=analyze_modes(video,rows,config,modes,cache,ROOT,args.device,
                                                         shortcut=not args.no_miss_shortcut)
@@ -209,16 +211,25 @@ def process(video,target,rows,meta,ref,config,args,cache):
     save_json(target/'refinement.json',refinements)
     for mode in modes:
         result=results[mode]
+        selected_actor=actor_report.get('selected')
+        actor_role=next((role for role in actor_report.get('roles',[]) if role['candidate']==selected_actor),{})
+        result['athlete_selection']=dict(status=actor_report.get('status'),candidate=selected_actor,
+            path=actor_role.get('path'),role_evidence=actor_role)
         result['estimation_seconds']=timing['postprocess_seconds']
         result.update(frame_index_base=0,coordinate_system='original_image_pixels_x_right_y_down',is_estimate=True)
         result['diagnostics']=dict(tracked_frames=sum(o['track_status']=='tracked' for o in rows),
+                                   person_detections=sum(o.get('person_candidate_count',0) for o in rows),
+                                   athlete_selection=meta.get('athlete_selection'),
                                    foot_frames=sum(bool(o['feet']) for o in rows),
                                    camera_stable_frames=sum(o['camera_stable'] for o in rows),
                                    camera_moved_frames=sum(o.get('camera_moved',False) for o in rows),
                                    depth_ground_frames=sum(any(f.get('depth_residual') is not None for f in o['feet']) for o in rows))
         if result['event'] is None:
             d=result['diagnostics']
-            if d['foot_frames']==0:result['failure_reason']='no_observed_shoes'
+            if meta.get('evidence_version',0)>=8 and d['tracked_frames']==0:
+                result['failure_reason']=('no_person_detections' if d['person_detections']==0 else
+                    ('ambiguous_landing_athletes' if d['athlete_selection']=='ambiguous_landing_athletes' else 'no_landing_athlete_selected'))
+            elif d['foot_frames']==0:result['failure_reason']='no_observed_shoes'
             elif d['camera_stable_frames']==0:result['failure_reason']='unreliable_background_registration'
             elif mode=='depth' and d['depth_ground_frames']==0:result['failure_reason']='no_reliable_depth_ground_reference'
         metrics=evaluate(result,ref,rows)

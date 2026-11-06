@@ -172,7 +172,8 @@ class ContactV7Tests(unittest.TestCase):
         bad = dict(camera_stable=False,camera_segment=1)
         recovery.update(frame,np.zeros_like(labels),person,parser,1,bad)
         _, diagnostic = recovery.update(frame,np.zeros_like(labels),person,parser,2,camera)
-        self.assertFalse(diagnostic['attempted'])
+        self.assertIsNone(recovery.last)
+        self.assertTrue(diagnostic['bootstrap'])
 
     def test_pending_candidate_has_no_confirmed_point_or_crosshair(self):
         rows = observations(); result = estimate(rows); result['status']='needs_review'
